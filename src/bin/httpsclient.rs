@@ -1,6 +1,7 @@
 use bytes::{Bytes, BytesMut, Buf};
 use ring::{agreement, rand::SecureRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use sha2::Digest;
 
 use nsfu::{ReadablePacketFragment, WritablePacketFragment};
 
@@ -72,6 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         extensions,
     };
 
+    let mut handshake_hasher = sha2::Sha256::new();
+    client_hello.hash(&mut handshake_hasher)?;
+
     let client_hello = nsfu::Record::Handshake(
         nsfu::ProtocolVersion::tlsv1(),
         client_hello,
@@ -84,25 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("written={}", written);
     println!("len={}", client_hello_buffer.len());
 
-    // let mut client_hello_buffer: Bytes = client_hello_buffer.into();
-
-    // let mut ctx = nsfu::Context::default();
-    // let start = client_hello_buffer.remaining();
-    // let client_hello_recovered = nsfu::Record::read(&mut client_hello_buffer, &mut ctx)?;
-    // let end = client_hello_buffer.remaining();
-    // assert_eq!(start - end, written);
-
-    // println!("{:#?}", client_hello_recovered);
-
-    // let mut socket = tokio::net::TcpStream::connect("127.0.0.1:8443").await?;
     let mut socket = tokio::net::TcpStream::connect("142.250.74.132:443").await?;
-    // let mut socket = tokio::net::TcpStream::connect("205.251.219.56:443").await?;
     socket.write_all(&client_hello_buffer).await?;
 
     let mut server_response_buffer = BytesMut::new();
     loop {
         let read = socket.read_buf(&mut server_response_buffer).await?;
-        println!("read {}", read);
+        println!("read {} bytes from server", read);
         if read == 0 {
             break;
         }
@@ -110,34 +102,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut server_response_buffer: Bytes = server_response_buffer.into();
 
-    let mut server_random: Option<nsfu::handshake::Random> = None;
-    let mut selected_cipher_suite: Option<nsfu::CipherSuite> = None;
-    let mut server_extensions: Option<nsfu::TlsVec<nsfu::Extension, 2>> = None;
+    let mut server_hello: Option<nsfu::handshake::Message> = None;
+    let mut encrypted_records = vec![];
     while server_response_buffer.remaining() > 0 {
         let mut context = nsfu::Context::default();
+
+        let aad: Vec<u8> = server_response_buffer[0..5].into();
+
         let record = nsfu::Record::read(
             &mut server_response_buffer,
             &mut context,
         )?;
 
-        println!("{:#?}", record);
-
         match record {
-            nsfu::Record::Handshake(_, nsfu::Message::ServerHello {
-                random,
-                cipher_suite,
-                extensions,
-                ..
-            }) => {
-                server_random = Some(random);
-                selected_cipher_suite = Some(cipher_suite);
-                server_extensions = Some(extensions);
+            nsfu::Record::Handshake(_, message) => {
+                println!("Found server hello");
+                server_hello = Some(message.clone());
             },
-            _ => {}
+            nsfu::Record::ApplicationData(opaque) => {
+                println!("Got one encrypted record");
+                encrypted_records.push((aad, opaque));
+            }
+            _ => {
+                println!("One other record: {:#?}", record);
+            }
         }
     }
 
-    let server_extensions = server_extensions.unwrap();
+    let server_hello = server_hello.unwrap();
+    server_hello.hash(&mut handshake_hasher)?;
+
+    let handshake_hash = handshake_hasher.finalize();
+
+    let selected_cipher_suite: nsfu::CipherSuite;
+    let server_extensions: nsfu::TlsVec<nsfu::Extension, 2>;
+    match server_hello {
+        nsfu::Message::ServerHello { cipher_suite, extensions, .. } => {
+            selected_cipher_suite = cipher_suite.clone();
+            server_extensions = extensions.clone();
+        },
+        _ => panic!(),
+    }
 
     let mut group: Option<nsfu::extension::NamedGroup> = None;
     let mut peer_public_key: Option<agreement::UnparsedPublicKey<_>> = None;
@@ -154,20 +159,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    dbg!(server_random);
-    dbg!(selected_cipher_suite);
-    dbg!(group);
+    dbg!(&selected_cipher_suite);
+    dbg!(&group);
+
+    assert_eq!(nsfu::CipherSuite::TlsAes128GcmSha256, selected_cipher_suite);
+
     let peer_public_key = peer_public_key.unwrap();
 
-    agreement::agree_ephemeral(
+    let (mut server_handshake_key, client_handshake_key) = agreement::agree_ephemeral(
         my_private_key,
         &peer_public_key,
         ring::error::Unspecified,
-        |_key_material| {
-            dbg!(_key_material);
-            Ok(())
+        |key_material| {
+            match nsfu::key_schedule::derive_secrets(key_material, &handshake_hash) {
+                Ok(x) => Ok(x),
+                Err(e) => {
+                    eprintln!("agree_ephemeral: {:?}", e);
+                    Err(ring::error::Unspecified)
+                }
+            }
         },
     ).unwrap();
+
+    dbg!(&server_handshake_key);
+    dbg!(&client_handshake_key);
+
+    for (aad, nsfu::primitives::VarOpaque(mut data)) in encrypted_records {
+        println!("Decrypting record");
+
+        server_handshake_key.open_in_place(
+            ring::aead::Aad::from(aad),
+            &mut data,
+        ).unwrap();
+
+        let mut data: Bytes = data.into();
+
+        while dbg!(data.remaining()) > 0 {
+            let mut context = nsfu::Context::default();
+            let message = nsfu::Message::read(&mut data, &mut context);
+            dbg!(&message);
+        }
+
+        println!("Finished decrypting record");
+    }
 
     Ok(())
 }

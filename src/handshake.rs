@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
 use crate::{
     Result,
@@ -9,8 +9,7 @@ use crate::{
     ProtocolVersion,
     CipherSuite,
     extension::Extension,
-    bytes_ext::BufExt,
-    primitives::{FixedOpaque, VarOpaque, TlsVec},
+    primitives::{u24, FixedOpaque, VarOpaque, TlsVec},
 };
 
 pub type Random = FixedOpaque<32>;
@@ -29,11 +28,12 @@ pub enum MessageType {
     Alert,
     KeyUpdate,
     MessageHash,
+    Unknown(u8),
 }
 
 impl ReadablePacketFragment for MessageType {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let msg_type = buffer.read_u8()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let msg_type = u8::read(buffer, ctx)?;
         match msg_type {
             1 => Ok(MessageType::ClientHello),
             2 => Ok(MessageType::ServerHello),
@@ -47,7 +47,7 @@ impl ReadablePacketFragment for MessageType {
             21 => Ok(MessageType::Alert),
             24 => Ok(MessageType::KeyUpdate),
             254 => Ok(MessageType::MessageHash),
-            _ => Err(Error::UnknownMsgType(msg_type)),
+            _ => Ok(MessageType::Unknown(msg_type)),
         }
     }
 }
@@ -67,6 +67,7 @@ impl MessageType {
             MessageType::Alert => 21,
             MessageType::KeyUpdate => 24,
             MessageType::MessageHash => 254,
+            MessageType::Unknown(x) => *x,
         }
     }
 }
@@ -90,6 +91,10 @@ pub enum Message {
     EncryptedExtensions {
         extensions: TlsVec<Extension, 2>,
     },
+    Unknown {
+        msg_type: MessageType,
+        data: VarOpaque<3>,
+    }
 }
 
 impl Message {
@@ -98,19 +103,20 @@ impl Message {
             Message::ClientHello { .. } => MessageType::ClientHello,
             Message::ServerHello { .. } => MessageType::ServerHello,
             Message::EncryptedExtensions { .. } => MessageType::EncryptedExtensions,
+            Message::Unknown { msg_type, .. } => *msg_type,
         }
     }
 }
 
 impl ReadablePacketFragment for Message {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
-        let msg_type = dbg!(MessageType::read(buffer, ctx)?);
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let msg_type = MessageType::read(buffer, ctx)?;
 
         ctx.message_type = Some(msg_type);
 
         match msg_type {
             MessageType::ClientHello => {
-                let _msg_len = buffer.read_u24()?;
+                let _msg_len = u24::read(buffer, ctx)?;
 
                 let version = ProtocolVersion::read(buffer, ctx)?;
                 let random = Random::read(buffer, ctx)?;
@@ -119,12 +125,12 @@ impl ReadablePacketFragment for Message {
 
                 let cipher_suites = TlsVec::read(buffer, ctx)?;
 
-                let legacy_compression_methods_len = buffer.read_u8()?;
+                let legacy_compression_methods_len = u8::read(buffer, ctx)?;
                 if legacy_compression_methods_len != 1 {
                     return Err(Error::IllegalParameter("legacy_compression_methods_len"));
                 }
 
-                let legacy_compression_method = buffer.read_u8()?;
+                let legacy_compression_method = u8::read(buffer, ctx)?;
                 if legacy_compression_method != 0 {
                     return Err(Error::IllegalParameter("legacy_compression_method"));
                 }
@@ -140,21 +146,21 @@ impl ReadablePacketFragment for Message {
                 })
             }
             MessageType::ServerHello => {
-                let _msg_len = dbg!(buffer.read_u24()?);
+                let _msg_len = u24::read(buffer, ctx)?;
 
                 let version = ProtocolVersion::read(buffer, ctx)?;
                 let random = Random::read(buffer, ctx)?;
 
                 let legacy_session_id = VarOpaque::read(buffer, ctx)?;
 
-                let cipher_suite = dbg!(CipherSuite::read(buffer, ctx)?);
+                let cipher_suite = CipherSuite::read(buffer, ctx)?;
 
-                let legacy_compression_method = dbg!(buffer.read_u8()?);
+                let legacy_compression_method = u8::read(buffer, ctx)?;
                 if legacy_compression_method != 0 {
                     return Err(Error::IllegalParameter("legacy_compression_method"));
                 }
 
-                let extensions = dbg!(TlsVec::read(buffer, ctx)?);
+                let extensions = TlsVec::read(buffer, ctx)?;
 
                 Ok(Message::ServerHello {
                     version,
@@ -165,11 +171,17 @@ impl ReadablePacketFragment for Message {
                 })
             }
             MessageType::EncryptedExtensions => {
-                let _msg_len = buffer.read_u24()?;
+                let _msg_len = u24::read(buffer, ctx)?;
                 let extensions = TlsVec::read(buffer, ctx)?;
                 Ok(Message::EncryptedExtensions { extensions })
             }
-            _ => return Err(Error::UnimplementedMsgType(msg_type)),
+            _ => {
+                let data = VarOpaque::read(buffer, ctx)?;
+                Ok(Message::Unknown {
+                    msg_type,
+                    data,
+                })
+            },
         }
     }
 }
@@ -215,21 +227,21 @@ impl WritablePacketFragment for Message {
             Message::EncryptedExtensions { extensions } => {
                 written += extensions.written_length();
             }
+            Message::Unknown { .. } => {
+                todo!()
+            }
         }
 
         written
     }
 
     fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        let mut written = 4;
+        let mut written = 0;
 
-        buffer.put_u8(self.msg_type().num());
+        written += self.msg_type().num().write(buffer)?;
 
         // 24-bit message length
-        let [_, _, _, _, _, a, b, c] = (self.written_length() - 4).to_be_bytes();
-        buffer.put_u8(a);
-        buffer.put_u8(b);
-        buffer.put_u8(c);
+        written += u24(self.written_length() as u32 - 4).write(buffer)?;
 
         match self {
             Message::ClientHello {
@@ -270,6 +282,9 @@ impl WritablePacketFragment for Message {
             }
             Message::EncryptedExtensions { extensions } => {
                 written += extensions.write(buffer)?;
+            }
+            Message::Unknown { .. } => {
+                todo!()
             }
         }
 

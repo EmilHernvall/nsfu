@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
 use crate::{
     Result,
@@ -8,7 +8,6 @@ use crate::{
     Context,
     ProtocolVersion,
     MessageType,
-    bytes_ext::BufExt,
     primitives::{VarOpaque, TlsVec},
 };
 
@@ -25,8 +24,8 @@ pub struct ServerName {
 }
 
 impl ReadablePacketFragment for ServerName {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
-        let name_type = buffer.read_u8()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let name_type = u8::read(buffer, ctx)?;
         let host_name = VarOpaque::read(buffer, ctx)?;
         Ok(ServerName {
             name_type,
@@ -54,7 +53,7 @@ pub struct OIDFilter {
 }
 
 impl ReadablePacketFragment for OIDFilter {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let certificate_extension_oid = VarOpaque::read(buffer, ctx)?;
         let certificate_extension_values = VarOpaque::read(buffer, ctx)?;
         Ok(OIDFilter {
@@ -84,7 +83,7 @@ pub struct KeyShareEntry {
 }
 
 impl ReadablePacketFragment for KeyShareEntry {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let group = NamedGroup::read(buffer, ctx)?;
         let key_exchange = VarOpaque::read(buffer, ctx)?;
         Ok(KeyShareEntry {
@@ -125,8 +124,8 @@ pub enum NamedGroup {
 }
 
 impl ReadablePacketFragment for NamedGroup {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let named_group = buffer.read_u16()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let named_group = u16::read(buffer, ctx)?;
         match named_group {
             // Elliptic Curve Groups (ECDHE)
             0x0017 => Ok(NamedGroup::SECP256R1),
@@ -210,8 +209,8 @@ pub enum SignatureScheme {
 }
 
 impl ReadablePacketFragment for SignatureScheme {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let signature_scheme = buffer.read_u16()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let signature_scheme = u16::read(buffer, ctx)?;
         match signature_scheme {
             0x0401 => Ok(SignatureScheme::RsaPkcs1Sha256),
             0x0501 => Ok(SignatureScheme::RsaPkcs1Sha384),
@@ -267,25 +266,22 @@ impl WritablePacketFragment for SignatureScheme {
 }
 
 #[derive(Clone, Debug)]
-pub struct DistinguishedName(pub Vec<u8>);
+pub struct DistinguishedName(VarOpaque<2>);
 
 impl ReadablePacketFragment for DistinguishedName {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let len = buffer.read_u16()?;
-        let mut name = vec![0; len as usize];
-        buffer.read_slice(&mut name)?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let name = VarOpaque::read(buffer, ctx)?;
         Ok(DistinguishedName(name))
     }
 }
 
 impl WritablePacketFragment for DistinguishedName {
     fn written_length(&self) -> usize {
-        2 + self.0.len()
+        self.0.written_length()
     }
 
     fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        buffer.put_slice(&self.0);
-        Ok(self.0.len())
+        self.0.write(buffer)
     }
 }
 
@@ -354,12 +350,9 @@ impl Extension {
 }
 
 impl ReadablePacketFragment for Extension {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
-        let extension_type = buffer.read_u16()?;
-        let length = buffer.read_u16()?;
-
-        dbg!(extension_type);
-        dbg!(length);
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let extension_type = u16::read(buffer, ctx)?;
+        let length = u16::read(buffer, ctx)?;
 
         match extension_type {
             0 => {
@@ -386,7 +379,6 @@ impl ReadablePacketFragment for Extension {
                     SupportedVersions::ServerHello(version),
                 ))
             }
-            43 => todo!(), // Error::UnexpectedExtension
             44 => {
                 let cookie = VarOpaque::read(buffer, ctx)?;
                 Ok(Extension::Cookie(cookie))
@@ -411,10 +403,12 @@ impl ReadablePacketFragment for Extension {
                 let entry = KeyShareEntry::read(buffer, ctx)?;
                 Ok(Extension::KeyShare(KeyShare::ServerHello(entry)))
             }
-            51 => todo!(), // Error::UnexpectedExtension
             _ => {
+                if buffer.remaining() < length as usize {
+                    return Err(Error::EOF);
+                }
                 let mut opaque = vec![0; length as usize];
-                buffer.read_slice(&mut opaque)?;
+                buffer.copy_to_slice(&mut opaque);
                 Ok(Extension::Unknown(extension_type, VarOpaque::<2>(opaque)))
             },
         }

@@ -1,4 +1,4 @@
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
 use crate::{
     Result,
@@ -6,8 +6,76 @@ use crate::{
     ReadablePacketFragment,
     WritablePacketFragment,
     Context,
-    bytes_ext::BufExt,
 };
+
+#[allow(non_camel_case_types)]
+pub struct u24(pub u32);
+
+impl ReadablePacketFragment for u8 {
+    fn read<B: Buf>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
+        if !buffer.has_remaining() {
+            return Err(Error::EOF);
+        }
+
+        Ok(buffer.get_u8())
+    }
+}
+
+impl WritablePacketFragment for u8 {
+    fn written_length(&self) -> usize {
+        1
+    }
+
+    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+        buffer.put_u8(*self);
+        Ok(1)
+    }
+}
+
+impl ReadablePacketFragment for u16 {
+    fn read<B: Buf>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
+        if buffer.remaining() < 2 {
+            return Err(Error::EOF);
+        }
+
+        Ok(buffer.get_u16())
+    }
+}
+
+impl WritablePacketFragment for u16 {
+    fn written_length(&self) -> usize {
+        2
+    }
+
+    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+        buffer.put_u16(*self);
+        Ok(2)
+    }
+}
+
+impl ReadablePacketFragment for u24 {
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let a = u8::read(buffer, ctx)? as u32;
+        let b = u8::read(buffer, ctx)? as u32;
+        let c = u8::read(buffer, ctx)? as u32;
+
+        Ok(u24((a << 16) | (b << 8) | c))
+    }
+}
+
+impl WritablePacketFragment for u24 {
+    fn written_length(&self) -> usize {
+        3
+    }
+
+    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+        let [_, a, b, c] = self.0.to_be_bytes();
+        buffer.put_u8(a);
+        buffer.put_u8(b);
+        buffer.put_u8(c);
+        Ok(3)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TlsVec<T, const N: usize>(pub Vec<T>);
@@ -19,12 +87,12 @@ impl<T, const N: usize> From<Vec<T>> for TlsVec<T, N> {
 }
 
 impl<T: ReadablePacketFragment> ReadablePacketFragment for TlsVec<T, 1> {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
-        let len = buffer.read_u8()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let len = u8::read(buffer, ctx)?;
 
-        let target = buffer.remaining_bytes() - len as usize;
+        let target = buffer.remaining() - len as usize;
         let mut vec = Vec::new();
-        while buffer.remaining_bytes() > target {
+        while buffer.remaining() > target {
             vec.push(T::read(buffer, ctx)?);
         }
 
@@ -33,12 +101,12 @@ impl<T: ReadablePacketFragment> ReadablePacketFragment for TlsVec<T, 1> {
 }
 
 impl<T: ReadablePacketFragment> ReadablePacketFragment for TlsVec<T, 2> {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
-        let len = buffer.read_u16()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let len = u16::read(buffer, ctx)?;
 
-        let target = buffer.remaining_bytes() - len as usize;
+        let target = buffer.remaining() - len as usize;
         let mut vec = Vec::new();
-        while buffer.remaining_bytes() > target {
+        while buffer.remaining() > target {
             vec.push(T::read(buffer, ctx)?);
         }
 
@@ -101,9 +169,12 @@ impl<const N: usize> FixedOpaque<N> {
 }
 
 impl<const N: usize> ReadablePacketFragment for FixedOpaque<N> {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
+    fn read<B: Buf>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
+        if buffer.remaining() < N {
+            return Err(Error::EOF);
+        }
         let mut vec = [0; N];
-        buffer.read_slice(&mut vec)?;
+        buffer.copy_to_slice(&mut vec);
         Ok(FixedOpaque(vec))
     }
 }
@@ -129,19 +200,37 @@ impl<T, const N: usize> From<T> for VarOpaque<N> where T: AsRef<[u8]> {
 }
 
 impl ReadablePacketFragment for VarOpaque<1> {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let len = buffer.read_u8()? as usize;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let len = u8::read(buffer, ctx)? as usize;
+        if buffer.remaining() < len {
+            return Err(Error::EOF);
+        }
         let mut vec = vec![0; len];
-        buffer.read_slice(&mut vec)?;
+        buffer.copy_to_slice(&mut vec);
         Ok(VarOpaque(vec))
     }
 }
 
 impl ReadablePacketFragment for VarOpaque<2> {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let len = buffer.read_u16()? as usize;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let len = u16::read(buffer, ctx)? as usize;
+        if buffer.remaining() < len {
+            return Err(Error::EOF);
+        }
         let mut vec = vec![0; len];
-        buffer.read_slice(&mut vec)?;
+        buffer.copy_to_slice(&mut vec);
+        Ok(VarOpaque(vec))
+    }
+}
+
+impl ReadablePacketFragment for VarOpaque<3> {
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let len = u24::read(buffer, ctx)?.0 as usize;
+        if buffer.remaining() < len {
+            return Err(Error::EOF);
+        }
+        let mut vec = vec![0; len];
+        buffer.copy_to_slice(&mut vec);
         Ok(VarOpaque(vec))
     }
 }
@@ -171,6 +260,21 @@ impl WritablePacketFragment for VarOpaque<2> {
             return Err(Error::Overflow);
         }
         buffer.put_u16(self.0.len() as u16);
+        buffer.put_slice(&self.0);
+        Ok(2 + self.0.len())
+    }
+}
+
+impl WritablePacketFragment for VarOpaque<3> {
+    fn written_length(&self) -> usize {
+        3 + self.0.len()
+    }
+
+    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+        if self.0.len() >= 0xFFFF {
+            return Err(Error::Overflow);
+        }
+        u24(self.0.len() as u32).write(buffer)?;
         buffer.put_slice(&self.0);
         Ok(2 + self.0.len())
     }

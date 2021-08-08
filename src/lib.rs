@@ -1,13 +1,12 @@
 use thiserror::Error;
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
-mod bytes_ext;
 pub mod primitives;
 pub mod extension;
 pub mod handshake;
 pub mod alert;
+pub mod key_schedule;
 
-use bytes_ext::*;
 pub use primitives::{TlsVec, VarOpaque, FixedOpaque};
 pub use extension::Extension;
 pub use handshake::{Message, MessageType};
@@ -18,8 +17,6 @@ pub enum Error {
     EOF,
     #[error("buffer overflow")]
     Overflow,
-    #[error("unknown tls message type: {0}")]
-    UnknownMsgType(u8),
     #[error("unknown tls cipher suite: {0}, {1}")]
     UnknownCipherSuite(u8, u8),
     #[error("illegal parameter: {0}")]
@@ -28,8 +25,8 @@ pub enum Error {
     UnknownNamedGroup(u16),
     #[error("unknown record type: {0}")]
     UnknownRecordType(u8),
-    #[error("unimplemented message type: {0:?}")]
-    UnimplementedMsgType(MessageType),
+    #[error("hkdf")]
+    Hkdf,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -47,13 +44,21 @@ impl Default for Context {
 }
 
 pub trait ReadablePacketFragment {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self>
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self>
     where Self: Sized;
 }
 
 pub trait WritablePacketFragment {
     fn written_length(&self) -> usize;
     fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize>;
+
+    fn hash<H: sha2::Digest>(&self, hasher: &mut H) -> Result<()> {
+        let mut buffer = vec![];
+        self.write(&mut buffer)?;
+        hasher.update(&buffer);
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,8 +79,8 @@ impl ProtocolVersion {
 }
 
 impl ReadablePacketFragment for ProtocolVersion {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let protocol_version = buffer.read_u16()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let protocol_version = u16::read(buffer, ctx)?;
         Ok(ProtocolVersion(protocol_version))
     }
 }
@@ -92,7 +97,7 @@ impl WritablePacketFragment for ProtocolVersion {
 }
 
 /// Cryptographic suite selector
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CipherSuite {
       TlsAes128Ccm8Sha256,
       TlsAes128CcmSha256,
@@ -103,11 +108,10 @@ pub enum CipherSuite {
 }
 
 impl ReadablePacketFragment for CipherSuite {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let mut selector = [0; 2];
-        buffer.read_slice(&mut selector)?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let selector: FixedOpaque<2> = FixedOpaque::read(buffer, ctx)?;
 
-        match selector {
+        match selector.0 {
             [0x13, 0x05] => Ok(CipherSuite::TlsAes128Ccm8Sha256),
             [0x13, 0x04] => Ok(CipherSuite::TlsAes128CcmSha256),
             [0x13, 0x01] => Ok(CipherSuite::TlsAes128GcmSha256),
@@ -147,8 +151,8 @@ pub enum Record {
 }
 
 impl ReadablePacketFragment for Record {
-    fn read<B: BufExt>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
-        let content_type = dbg!(buffer.read_u8()?);
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let content_type = u8::read(buffer, ctx)?;
         let version = ProtocolVersion::read(buffer, ctx)?;
 
         match content_type {
@@ -161,13 +165,13 @@ impl ReadablePacketFragment for Record {
                 Ok(Record::ChangeCipherSpec(opaque))
             },
             21 => {
-                let _length = buffer.read_u16()?;
+                let _length = u16::read(buffer, ctx)?;
                 let level = alert::AlertLevel::read(buffer, ctx)?;
                 let description = alert::AlertDescription::read(buffer, ctx)?;
                 Ok(Record::Alert(level, description))
             },
             22 => {
-                let length = buffer.read_u16()?;
+                let length = u16::read(buffer, ctx)?;
                 let start = buffer.remaining();
                 let message = Message::read(buffer, ctx)?;
                 let end = buffer.remaining();

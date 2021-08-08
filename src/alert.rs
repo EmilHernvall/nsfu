@@ -4,10 +4,9 @@ use crate::{
     ReadablePacketFragment,
     WritablePacketFragment,
     Context,
-    bytes_ext::BufExt,
 };
 
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AlertLevel {
@@ -17,8 +16,8 @@ pub enum AlertLevel {
 }
 
 impl ReadablePacketFragment for AlertLevel {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let level = buffer.read_u8()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let level = u8::read(buffer, ctx)?;
         match level {
             0 => Ok(AlertLevel::NotSet),
             1 => Ok(AlertLevel::Warning),
@@ -78,8 +77,8 @@ pub enum AlertDescription {
 }
 
 impl ReadablePacketFragment for AlertDescription {
-    fn read<B: BufExt>(buffer: &mut B, _ctx: &mut Context) -> Result<Self> {
-        let description = buffer.read_u8()?;
+    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let description = u8::read(buffer, ctx)?;
         let description = match description {
             0 => AlertDescription::CloseNotify,
             10 => AlertDescription::UnexpectedMessage,

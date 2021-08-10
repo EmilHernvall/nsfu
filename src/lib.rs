@@ -1,5 +1,5 @@
 use thiserror::Error;
-use bytes::{Buf, BufMut};
+use std::io::{Read, Write};
 
 pub mod primitives;
 pub mod extension;
@@ -13,6 +13,8 @@ pub use handshake::{Message, MessageType};
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("end of file")]
     EOF,
     #[error("buffer overflow")]
@@ -44,13 +46,13 @@ impl Default for Context {
 }
 
 pub trait ReadablePacketFragment {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self>
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self>
     where Self: Sized;
 }
 
 pub trait WritablePacketFragment {
     fn written_length(&self) -> usize;
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize>;
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize>;
 
     fn hash<H: sha2::Digest>(&self, hasher: &mut H) -> Result<()> {
         let mut buffer = vec![];
@@ -79,7 +81,7 @@ impl ProtocolVersion {
 }
 
 impl ReadablePacketFragment for ProtocolVersion {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let protocol_version = u16::read(buffer, ctx)?;
         Ok(ProtocolVersion(protocol_version))
     }
@@ -90,9 +92,8 @@ impl WritablePacketFragment for ProtocolVersion {
         2
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        buffer.put_u16(self.0);
-        Ok(2)
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        self.0.write(buffer)
     }
 }
 
@@ -108,7 +109,7 @@ pub enum CipherSuite {
 }
 
 impl ReadablePacketFragment for CipherSuite {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let selector: FixedOpaque<2> = FixedOpaque::read(buffer, ctx)?;
 
         match selector.0 {
@@ -127,7 +128,7 @@ impl WritablePacketFragment for CipherSuite {
         2
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
         let selector = match self {
             CipherSuite::TlsAes128Ccm8Sha256 => [0x13, 0x05],
             CipherSuite::TlsAes128CcmSha256 => [0x13, 0x04],
@@ -136,96 +137,194 @@ impl WritablePacketFragment for CipherSuite {
             CipherSuite::TlsChacha20poly1305Sha256 => [0x13, 0x03],
             CipherSuite::Unknown(a, b) => return Err(Error::UnknownCipherSuite(*a, *b)),
         };
-        buffer.put_slice(&selector);
+        buffer.write(&selector)?;
+        Ok(2)
+    }
+}
+
+#[derive(Clone,Copy,Debug)]
+pub enum RecordType {
+    Invalid,
+    ChangeCipherSpec,
+    Alert,
+    Handshake,
+    ApplicationData,
+}
+
+impl ReadablePacketFragment for RecordType {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let record_type = u8::read(buffer, ctx)?;
+
+        match record_type {
+            0 => Ok(RecordType::Invalid),
+            20 => Ok(RecordType::ChangeCipherSpec),
+            21 => Ok(RecordType::Alert),
+            22 => Ok(RecordType::Handshake),
+            23 => Ok(RecordType::ApplicationData),
+            _ => Err(Error::UnknownRecordType(record_type))
+        }
+    }
+}
+
+impl WritablePacketFragment for RecordType {
+    fn written_length(&self) -> usize {
+        2
+    }
+
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        let record_type: u8 = match self {
+            RecordType::Invalid => 0,
+            RecordType::ChangeCipherSpec => 20,
+            RecordType::Alert => 21,
+            RecordType::Handshake => 22,
+            RecordType::ApplicationData => 23,
+        };
+
+        record_type.write(buffer)?;
+
         Ok(2)
     }
 }
 
 #[derive(Clone,Debug)]
-pub enum Record {
-    Invalid(VarOpaque<2>),
-    ChangeCipherSpec(VarOpaque<2>),
+pub struct Record {
+    record_type: RecordType,
+    version: ProtocolVersion,
+    length: u16,
+    pub variant: RecordVariant,
+}
+
+impl Record {
+    pub fn preamble(&self) -> Vec<u8> {
+        let mut preamble = Vec::new();
+        self.record_type.write(&mut preamble).unwrap();
+        self.version.write(&mut preamble).unwrap();
+        self.length.write(&mut preamble).unwrap();
+        preamble
+    }
+}
+
+#[derive(Clone,Debug)]
+pub enum RecordVariant {
+    Invalid(VarOpaque<u16>),
+    ChangeCipherSpec(VarOpaque<u16>),
     Alert(alert::AlertLevel, alert::AlertDescription),
-    Handshake(ProtocolVersion, Message),
-    ApplicationData(VarOpaque<2>),
+    Handshake(Message),
+    ApplicationData(VarOpaque<u16>),
+}
+
+impl RecordVariant {
+    pub fn record_type(&self) -> RecordType {
+        match self {
+            RecordVariant::Invalid(_) => RecordType::Invalid,
+            RecordVariant::ChangeCipherSpec(_) => RecordType::ChangeCipherSpec,
+            RecordVariant::Alert(_, _) => RecordType::Alert,
+            RecordVariant::Handshake(_) => RecordType::Handshake,
+            RecordVariant::ApplicationData(_) => RecordType::ApplicationData,
+        }
+    }
 }
 
 impl ReadablePacketFragment for Record {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
-        let content_type = u8::read(buffer, ctx)?;
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+        let record_type = RecordType::read(buffer, ctx)?;
         let version = ProtocolVersion::read(buffer, ctx)?;
 
-        match content_type {
-            0 => {
+        match record_type {
+            RecordType::Invalid => {
                 let opaque = VarOpaque::read(buffer, ctx)?;
-                Ok(Record::Invalid(opaque))
+                Ok(Record {
+                    record_type,
+                    version,
+                    length: opaque.len() as u16,
+                    variant: RecordVariant::Invalid(opaque),
+                })
             },
-            20 => {
+            RecordType::ChangeCipherSpec => {
                 let opaque = VarOpaque::read(buffer, ctx)?;
-                Ok(Record::ChangeCipherSpec(opaque))
+                Ok(Record {
+                    record_type,
+                    version,
+                    length: opaque.len() as u16,
+                    variant: RecordVariant::ChangeCipherSpec(opaque),
+                })
             },
-            21 => {
-                let _length = u16::read(buffer, ctx)?;
+            RecordType::Alert => {
+                let length = u16::read(buffer, ctx)?;
                 let level = alert::AlertLevel::read(buffer, ctx)?;
                 let description = alert::AlertDescription::read(buffer, ctx)?;
-                Ok(Record::Alert(level, description))
+                Ok(Record {
+                    record_type,
+                    version,
+                    length,
+                    variant: RecordVariant::Alert(level, description),
+                })
             },
-            22 => {
+            RecordType::Handshake => {
                 let length = u16::read(buffer, ctx)?;
-                let start = buffer.remaining();
                 let message = Message::read(buffer, ctx)?;
-                let end = buffer.remaining();
-                assert_eq!(start - end, length as usize);
-                Ok(Record::Handshake(version, message))
+                Ok(Record {
+                    record_type,
+                    version,
+                    length,
+                    variant: RecordVariant::Handshake(message),
+                })
             },
-            23 => {
+            RecordType::ApplicationData => {
                 let opaque = VarOpaque::read(buffer, ctx)?;
-                Ok(Record::ApplicationData(opaque))
-            },
-            _ => {
-                Err(Error::UnknownRecordType(content_type))
+                Ok(Record {
+                    record_type,
+                    version,
+                    length: opaque.len() as u16,
+                    variant: RecordVariant::ApplicationData(opaque),
+                })
             },
         }
     }
 }
 
-impl WritablePacketFragment for Record {
+impl WritablePacketFragment for RecordVariant {
     fn written_length(&self) -> usize {
         let written = match self {
-            Record::Invalid(opaque) => opaque.written_length(),
-            Record::ChangeCipherSpec(opaque) => opaque.written_length(),
-            Record::Alert(_level, _description) => todo!(),
-            Record::Handshake(_version, message) => 2 + message.written_length(),
-            Record::ApplicationData(opaque) => opaque.written_length(),
+            RecordVariant::Invalid(opaque) => opaque.written_length(),
+            RecordVariant::ChangeCipherSpec(opaque) => opaque.written_length(),
+            RecordVariant::Alert(level, description) => 2 + level.written_length() + description.written_length(),
+            RecordVariant::Handshake(message) => 2 + message.written_length(),
+            RecordVariant::ApplicationData(opaque) => opaque.written_length(),
         };
 
         written + 3
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
         let mut written = 0;
 
-        match self {
-            Record::Invalid(_opaque) => todo!(),
-            Record::ChangeCipherSpec(_opaque) => todo!(),
-            Record::Alert(level, description) => {
-                buffer.put_u8(21);
-                written += 1;
-                written += ProtocolVersion::tlsv1().write(buffer)?;
-                buffer.put_u16(2);
-                written += 2;
+        written += self.record_type().write(buffer)?;
+        written += ProtocolVersion::tlsv1().write(buffer)?;
+
+        let len = (self.written_length() - 5) as u16;
+        written += len.write(buffer)?;
+
+        match &self {
+            RecordVariant::Invalid(opaque) => {
+                buffer.write(&opaque)?;
+                written += opaque.len();
+            },
+            RecordVariant::ChangeCipherSpec(opaque) => {
+                buffer.write(&opaque)?;
+                written += opaque.len();
+            },
+            RecordVariant::Alert(level, description) => {
                 written += level.write(buffer)?;
                 written += description.write(buffer)?;
             },
-            Record::Handshake(version, message) => {
-                buffer.put_u8(22);
-                written += 1;
-                written += version.write(buffer)?;
-                buffer.put_u16(message.written_length() as u16);
-                written += 2;
-                written += message.write(buffer)?;
+            RecordVariant::Handshake(message) => {
+                written += message.write(buffer)?
             },
-            Record::ApplicationData(_opaque) => todo!(),
+            RecordVariant::ApplicationData(opaque) => {
+                buffer.write(&opaque)?;
+                written += opaque.len();
+            },
         }
 
         Ok(written)
@@ -236,32 +335,32 @@ impl WritablePacketFragment for Record {
 pub mod tests {
     use super::*;
 
-    use bytes::{Buf, Bytes, BytesMut};
+    use std::io::Cursor;
 
     #[test]
     fn test_encode_decode_alert() {
         use alert::*;
 
-        let alert = Record::Alert(
+        let alert = RecordVariant::Alert(
             AlertLevel::Fatal,
             AlertDescription::InternalError,
         );
 
-        let mut buffer = BytesMut::new();
+        let mut buffer = Vec::new();
         let written = alert.write(&mut buffer).unwrap();
         assert_eq!(7, written);
 
-        let mut buffer: Bytes = buffer.into();
+        let mut buffer = Cursor::new(buffer);
 
         let mut context = Context::default();
 
-        let start = buffer.remaining();
+        // let start = buffer.remaining();
         let alert: Record = Record::read(&mut buffer, &mut context).unwrap();
-        let end = buffer.remaining();
-        assert_eq!(7, start - end);
+        // let end = buffer.remaining();
+        // assert_eq!(7, start - end);
 
-        match alert {
-            Record::Alert(AlertLevel::Fatal, AlertDescription::InternalError) => {},
+        match &alert.variant {
+            RecordVariant::Alert(AlertLevel::Fatal, AlertDescription::InternalError) => {},
             _ => panic!()
         }
     }

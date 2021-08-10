@@ -6,7 +6,7 @@ use crate::{
     Context,
 };
 
-use bytes::{Buf, BufMut};
+use std::io::{Read, Write};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AlertLevel {
@@ -16,7 +16,7 @@ pub enum AlertLevel {
 }
 
 impl ReadablePacketFragment for AlertLevel {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let level = u8::read(buffer, ctx)?;
         match level {
             0 => Ok(AlertLevel::NotSet),
@@ -32,14 +32,14 @@ impl WritablePacketFragment for AlertLevel {
         1
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        let level = match self {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        let level: u8 = match self {
             AlertLevel::NotSet => 0,
             AlertLevel::Warning => 1,
             AlertLevel::Fatal => 2,
         };
 
-        buffer.put_u8(level);
+        level.write(buffer)?;
 
         Ok(1)
     }
@@ -77,7 +77,7 @@ pub enum AlertDescription {
 }
 
 impl ReadablePacketFragment for AlertDescription {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let description = u8::read(buffer, ctx)?;
         let description = match description {
             0 => AlertDescription::CloseNotify,
@@ -118,8 +118,8 @@ impl WritablePacketFragment for AlertDescription {
         1
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        let description = match self {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        let description: u8 = match self {
             AlertDescription::CloseNotify => 0,
             AlertDescription::UnexpectedMessage => 10,
             AlertDescription::BadRecordMac => 20,
@@ -149,7 +149,7 @@ impl WritablePacketFragment for AlertDescription {
             AlertDescription::NoApplicationProtocol => 120,
         };
 
-        buffer.put_u8(description);
+        description.write(buffer)?;
 
         Ok(1)
     }

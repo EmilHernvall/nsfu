@@ -1,8 +1,9 @@
+use std::io::Write;
+
 use ring::{
     hkdf,
     aead::{self, BoundKey},
 };
-use bytes::BufMut;
 
 use crate::{
     Result,
@@ -13,8 +14,8 @@ use crate::{
 
 pub struct HkdfLabel {
    length: u16,
-   label: VarOpaque<1>,
-   context: VarOpaque<1>,
+   label: VarOpaque<u8>,
+   context: VarOpaque<u8>,
 }
 
 impl HkdfLabel {
@@ -33,10 +34,10 @@ impl HkdfLabel {
     }
 
     pub fn to_bytes(self) -> Result<Vec<u8>> {
-        let mut buffer = bytes::BytesMut::new();
+        let mut buffer = Vec::new();
         self.write(&mut buffer)?;
 
-        Ok(buffer.iter().copied().collect())
+        Ok(buffer)
     }
 }
 
@@ -45,9 +46,9 @@ impl WritablePacketFragment for HkdfLabel {
         2 + self.label.written_length() + self.context.written_length()
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        let mut written = 2;
-        buffer.put_u16(self.length);
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        let mut written = 0;
+        written += self.length.write(buffer)?;
         written += self.label.write(buffer)?;
         written += self.context.write(buffer)?;
         Ok(written)

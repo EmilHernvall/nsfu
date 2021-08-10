@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut};
+use std::io::{Read, Write};
 
 use crate::{
     Result,
@@ -13,18 +13,18 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub enum SupportedVersions {
-    ClientHello(TlsVec<ProtocolVersion, 1>),
+    ClientHello(TlsVec<ProtocolVersion, u8>),
     ServerHello(ProtocolVersion),
 }
 
 #[derive(Clone, Debug)]
 pub struct ServerName {
     pub name_type: u8,
-    pub host_name: VarOpaque<2>,
+    pub host_name: VarOpaque<u16>,
 }
 
 impl ReadablePacketFragment for ServerName {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let name_type = u8::read(buffer, ctx)?;
         let host_name = VarOpaque::read(buffer, ctx)?;
         Ok(ServerName {
@@ -39,8 +39,8 @@ impl WritablePacketFragment for ServerName {
         1 + self.host_name.written_length()
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        buffer.put_u8(self.name_type);
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        self.name_type.write(buffer)?;
         self.host_name.write(buffer)?;
         Ok(1 + self.host_name.written_length())
     }
@@ -48,12 +48,12 @@ impl WritablePacketFragment for ServerName {
 
 #[derive(Clone, Debug)]
 pub struct OIDFilter {
-    pub certificate_extension_oid: VarOpaque<1>,
-    pub certificate_extension_values: VarOpaque<2>,
+    pub certificate_extension_oid: VarOpaque<u8>,
+    pub certificate_extension_values: VarOpaque<u16>,
 }
 
 impl ReadablePacketFragment for OIDFilter {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let certificate_extension_oid = VarOpaque::read(buffer, ctx)?;
         let certificate_extension_values = VarOpaque::read(buffer, ctx)?;
         Ok(OIDFilter {
@@ -69,7 +69,7 @@ impl WritablePacketFragment for OIDFilter {
             + self.certificate_extension_values.written_length()
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
         self.certificate_extension_oid.write(buffer)?;
         self.certificate_extension_values.write(buffer)?;
         Ok(self.written_length())
@@ -79,11 +79,11 @@ impl WritablePacketFragment for OIDFilter {
 #[derive(Clone, Debug)]
 pub struct KeyShareEntry {
     pub group: NamedGroup,
-    pub key_exchange: VarOpaque<2>,
+    pub key_exchange: VarOpaque<u16>,
 }
 
 impl ReadablePacketFragment for KeyShareEntry {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let group = NamedGroup::read(buffer, ctx)?;
         let key_exchange = VarOpaque::read(buffer, ctx)?;
         Ok(KeyShareEntry {
@@ -98,7 +98,7 @@ impl WritablePacketFragment for KeyShareEntry {
         self.group.written_length() + self.key_exchange.written_length()
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
         self.group.write(buffer)?;
         self.key_exchange.write(buffer)?;
         Ok(self.written_length())
@@ -106,7 +106,7 @@ impl WritablePacketFragment for KeyShareEntry {
 }
 
 /// 2 bytes
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum NamedGroup {
     // Elliptic Curve Groups (ECDHE)
     SECP256R1,
@@ -124,7 +124,7 @@ pub enum NamedGroup {
 }
 
 impl ReadablePacketFragment for NamedGroup {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let named_group = u16::read(buffer, ctx)?;
         match named_group {
             // Elliptic Curve Groups (ECDHE)
@@ -151,8 +151,8 @@ impl WritablePacketFragment for NamedGroup {
         2
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        let named_group = match self {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        let named_group: u16 = match self {
             // Elliptic Curve Groups (ECDHE)
             NamedGroup::SECP256R1 => 0x0017,
             NamedGroup::SECP384R1 => 0x0018,
@@ -168,7 +168,7 @@ impl WritablePacketFragment for NamedGroup {
             NamedGroup::FFDHE8192 => 0x0104,
         };
 
-        buffer.put_u16(named_group);
+        named_group.write(buffer)?;
 
         Ok(2)
     }
@@ -209,7 +209,7 @@ pub enum SignatureScheme {
 }
 
 impl ReadablePacketFragment for SignatureScheme {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let signature_scheme = u16::read(buffer, ctx)?;
         match signature_scheme {
             0x0401 => Ok(SignatureScheme::RsaPkcs1Sha256),
@@ -238,7 +238,7 @@ impl WritablePacketFragment for SignatureScheme {
         2
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
         let signature_scheme = match self {
             SignatureScheme::RsaPkcs1Sha256 => 0x0401,
             SignatureScheme::RsaPkcs1Sha384 => 0x0501,
@@ -259,17 +259,17 @@ impl WritablePacketFragment for SignatureScheme {
             SignatureScheme::Unknown(x) => *x,
         };
 
-        buffer.put_u16(signature_scheme);
+        signature_scheme.write(buffer)?;
 
         Ok(2)
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct DistinguishedName(VarOpaque<2>);
+pub struct DistinguishedName(VarOpaque<u16>);
 
 impl ReadablePacketFragment for DistinguishedName {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let name = VarOpaque::read(buffer, ctx)?;
         Ok(DistinguishedName(name))
     }
@@ -280,28 +280,28 @@ impl WritablePacketFragment for DistinguishedName {
         self.0.written_length()
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
         self.0.write(buffer)
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum KeyShare {
-    ClientHello(TlsVec<KeyShareEntry, 2>),
+    ClientHello(TlsVec<KeyShareEntry, u16>),
     HelloRetryRequest(NamedGroup), // TODO: wat?
     ServerHello(KeyShareEntry),
 }
 
 #[derive(Clone, Debug)]
 pub enum Extension {
-    ServerName(TlsVec<ServerName, 2>),
+    ServerName(TlsVec<ServerName, u16>),
     MaxFragmentLength,
     StatusRequest,
-    SupportedGroups(TlsVec<NamedGroup, 2>),
-    SignatureAlgorithms(TlsVec<SignatureScheme, 2>),
+    SupportedGroups(TlsVec<NamedGroup, u16>),
+    SignatureAlgorithms(TlsVec<SignatureScheme, u16>),
     UseSrtp,
     Heartbeat,
-    ApplicationLayerProtocolNegotiation,
+    ApplicationLayerProtocolNegotiation(TlsVec<VarOpaque<u8>, u16>),
     SignedCertificateTimestamp,
     ClientCertificateType,
     ServerCertificateType,
@@ -309,14 +309,14 @@ pub enum Extension {
     PreSharedKey,
     EarlyData,
     SupportedVersions(SupportedVersions),
-    Cookie(VarOpaque<2>),
+    Cookie(VarOpaque<u16>),
     PskKeyExchangeModes,
-    CertificateAuthorities(TlsVec<DistinguishedName, 2>),
-    OidFilters(TlsVec<OIDFilter, 2>),
+    CertificateAuthorities(TlsVec<DistinguishedName, u16>),
+    OidFilters(TlsVec<OIDFilter, u16>),
     PostHandshakeAuth,
-    SignatureAlgorithmsCert(TlsVec<SignatureScheme, 2>),
+    SignatureAlgorithmsCert(TlsVec<SignatureScheme, u16>),
     KeyShare(KeyShare),
-    Unknown(u16, VarOpaque<2>),
+    Unknown(u16, VarOpaque<u16>),
 }
 
 impl Extension {
@@ -329,7 +329,7 @@ impl Extension {
             Extension::SignatureAlgorithms(_) => 13,
             Extension::UseSrtp => 14,
             Extension::Heartbeat => 15,
-            Extension::ApplicationLayerProtocolNegotiation => 16,
+            Extension::ApplicationLayerProtocolNegotiation(_) => 16,
             Extension::SignedCertificateTimestamp => 18,
             Extension::ClientCertificateType => 19,
             Extension::ServerCertificateType => 20,
@@ -350,12 +350,16 @@ impl Extension {
 }
 
 impl ReadablePacketFragment for Extension {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let extension_type = u16::read(buffer, ctx)?;
         let length = u16::read(buffer, ctx)?;
 
         match extension_type {
             0 => {
+                if length == 0 {
+                    return Ok(Extension::ServerName(vec![].into()));
+                }
+
                 let server_name_list = TlsVec::read(buffer, ctx)?;
                 Ok(Extension::ServerName(server_name_list))
             }
@@ -366,6 +370,10 @@ impl ReadablePacketFragment for Extension {
             13 => {
                 let signature_algorithms = TlsVec::read(buffer, ctx)?;
                 Ok(Extension::SignatureAlgorithms(signature_algorithms))
+            }
+            16 => {
+                let protocols = TlsVec::read(buffer, ctx)?;
+                Ok(Extension::ApplicationLayerProtocolNegotiation(protocols))
             }
             43 if ctx.message_type == Some(MessageType::ClientHello) => {
                 let versions = TlsVec::read(buffer, ctx)?;
@@ -404,12 +412,10 @@ impl ReadablePacketFragment for Extension {
                 Ok(Extension::KeyShare(KeyShare::ServerHello(entry)))
             }
             _ => {
-                if buffer.remaining() < length as usize {
-                    return Err(Error::EOF);
-                }
                 let mut opaque = vec![0; length as usize];
-                buffer.copy_to_slice(&mut opaque);
-                Ok(Extension::Unknown(extension_type, VarOpaque::<2>(opaque)))
+                let read = buffer.read(&mut opaque)?;
+                assert_eq!(read, length as usize);
+                Ok(Extension::Unknown(extension_type, opaque.into()))
             },
         }
     }
@@ -427,7 +433,9 @@ impl WritablePacketFragment for Extension {
             }
             Extension::UseSrtp => unimplemented!(),
             Extension::Heartbeat => unimplemented!(),
-            Extension::ApplicationLayerProtocolNegotiation => unimplemented!(),
+            Extension::ApplicationLayerProtocolNegotiation(protocols) => {
+                protocols.written_length()
+            },
             Extension::SignedCertificateTimestamp => unimplemented!(),
             Extension::ClientCertificateType => unimplemented!(),
             Extension::ServerCertificateType => unimplemented!(),
@@ -457,11 +465,14 @@ impl WritablePacketFragment for Extension {
         len + 4
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
-        let mut written = 4;
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
+        let mut written = 0;
+
         let extension_type = self.extension_type();
-        buffer.put_u16(extension_type);
-        buffer.put_u16((self.written_length() - 4) as u16);
+        written += extension_type.write(buffer)?;
+
+        let len = (self.written_length() - 4) as u16;
+        written += len.write(buffer)?;
 
         match self {
             Extension::ServerName(server_name_list) => {
@@ -477,7 +488,9 @@ impl WritablePacketFragment for Extension {
             }
             Extension::UseSrtp => unimplemented!(),
             Extension::Heartbeat => unimplemented!(),
-            Extension::ApplicationLayerProtocolNegotiation => unimplemented!(),
+            Extension::ApplicationLayerProtocolNegotiation(protocols) => {
+                written += protocols.write(buffer)?;
+            },
             Extension::SignedCertificateTimestamp => unimplemented!(),
             Extension::ClientCertificateType => unimplemented!(),
             Extension::ServerCertificateType => unimplemented!(),

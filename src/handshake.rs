@@ -1,16 +1,6 @@
-use bytes::{Buf, BufMut};
+use std::io::{Read, Write};
 
-use crate::{
-    Result,
-    Error,
-    ReadablePacketFragment,
-    WritablePacketFragment,
-    Context,
-    ProtocolVersion,
-    CipherSuite,
-    extension::Extension,
-    primitives::{u24, FixedOpaque, VarOpaque, TlsVec},
-};
+use crate::{CipherSuite, Context, Error, ProtocolVersion, ReadablePacketFragment, Result, WritablePacketFragment, extension::Extension, primitives::{FixedOpaque, ReadLength, TlsVec, VarOpaque, u24}};
 
 pub type Random = FixedOpaque<32>;
 
@@ -32,7 +22,7 @@ pub enum MessageType {
 }
 
 impl ReadablePacketFragment for MessageType {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let msg_type = u8::read(buffer, ctx)?;
         match msg_type {
             1 => Ok(MessageType::ClientHello),
@@ -77,23 +67,26 @@ pub enum Message {
     ClientHello {
         version: ProtocolVersion,
         random: Random,
-        legacy_session_id: VarOpaque<1>,
-        cipher_suites: TlsVec<CipherSuite, 2>,
-        extensions: TlsVec<Extension, 2>,
+        legacy_session_id: VarOpaque<u8>,
+        cipher_suites: TlsVec<CipherSuite, u16>,
+        extensions: TlsVec<Extension, u16>,
     },
     ServerHello {
         version: ProtocolVersion,
         random: Random,
-        legacy_session_id: VarOpaque<1>,
+        legacy_session_id: VarOpaque<u8>,
         cipher_suite: CipherSuite,
-        extensions: TlsVec<Extension, 2>,
+        extensions: TlsVec<Extension, u16>,
     },
     EncryptedExtensions {
-        extensions: TlsVec<Extension, 2>,
+        extensions: TlsVec<Extension, u16>,
+    },
+    Finished {
+        hash: VarOpaque<u24>,
     },
     Unknown {
         msg_type: MessageType,
-        data: VarOpaque<3>,
+        data: VarOpaque<u24>,
     }
 }
 
@@ -103,13 +96,14 @@ impl Message {
             Message::ClientHello { .. } => MessageType::ClientHello,
             Message::ServerHello { .. } => MessageType::ServerHello,
             Message::EncryptedExtensions { .. } => MessageType::EncryptedExtensions,
+            Message::Finished { .. } => MessageType::Finished,
             Message::Unknown { msg_type, .. } => *msg_type,
         }
     }
 }
 
 impl ReadablePacketFragment for Message {
-    fn read<B: Buf>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
+    fn read<B: Read>(buffer: &mut B, ctx: &mut Context) -> Result<Self> {
         let msg_type = MessageType::read(buffer, ctx)?;
 
         ctx.message_type = Some(msg_type);
@@ -175,6 +169,12 @@ impl ReadablePacketFragment for Message {
                 let extensions = TlsVec::read(buffer, ctx)?;
                 Ok(Message::EncryptedExtensions { extensions })
             }
+            MessageType::Finished => {
+                let hash = VarOpaque::read(buffer, ctx)?;
+                Ok(Message::Finished {
+                    hash,
+                })
+            }
             _ => {
                 let data = VarOpaque::read(buffer, ctx)?;
                 Ok(Message::Unknown {
@@ -227,6 +227,9 @@ impl WritablePacketFragment for Message {
             Message::EncryptedExtensions { extensions } => {
                 written += extensions.written_length();
             }
+            Message::Finished { hash } => {
+                written += hash.written_length();
+            }
             Message::Unknown { .. } => {
                 todo!()
             }
@@ -235,7 +238,7 @@ impl WritablePacketFragment for Message {
         written
     }
 
-    fn write<B: BufMut>(&self, buffer: &mut B) -> Result<usize> {
+    fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
         let mut written = 0;
 
         written += self.msg_type().num().write(buffer)?;
@@ -257,9 +260,8 @@ impl WritablePacketFragment for Message {
                 written += cipher_suites.write(buffer)?;
 
                 // legacy_compression_methods
-                buffer.put_u8(1);
-                buffer.put_u8(0);
-                written += 2;
+                written += 1u8.write(buffer)?;
+                written += 0u8.write(buffer)?;
 
                 written += extensions.write(buffer)?;
             }
@@ -276,15 +278,22 @@ impl WritablePacketFragment for Message {
                 written += cipher_suite.write(buffer)?;
 
                 // legacy_compression_method
-                buffer.put_u8(0);
+                written += 0u8.write(buffer)?;
 
                 written += extensions.write(buffer)?;
             }
             Message::EncryptedExtensions { extensions } => {
                 written += extensions.write(buffer)?;
             }
-            Message::Unknown { .. } => {
-                todo!()
+            Message::Finished { hash } => {
+                written += u24::from_usize(hash.len()).write(buffer)?;
+                written += hash.len() as usize;
+                buffer.write(&*hash)?;
+            }
+            Message::Unknown { data, .. } => {
+                written += u24::from_usize(data.len()).write(buffer)?;
+                written += data.len() as usize;
+                buffer.write(&*data)?;
             }
         }
 

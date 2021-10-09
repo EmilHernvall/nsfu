@@ -228,10 +228,10 @@ impl WritablePacketFragment for Message {
                 written += extensions.written_length();
             }
             Message::Finished { hash } => {
-                written += hash.written_length();
+                written += hash.len();
             }
-            Message::Unknown { .. } => {
-                todo!()
+            Message::Unknown { data, .. } => {
+                written += data.written_length() - 3;
             }
         }
 
@@ -286,12 +286,10 @@ impl WritablePacketFragment for Message {
                 written += extensions.write(buffer)?;
             }
             Message::Finished { hash } => {
-                written += u24::from_usize(hash.len()).write(buffer)?;
                 written += hash.len() as usize;
                 buffer.write(&*hash)?;
             }
             Message::Unknown { data, .. } => {
-                written += u24::from_usize(data.len()).write(buffer)?;
                 written += data.len() as usize;
                 buffer.write(&*data)?;
             }

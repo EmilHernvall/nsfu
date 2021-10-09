@@ -106,7 +106,7 @@ impl WritablePacketFragment for KeyShareEntry {
 }
 
 /// 2 bytes
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NamedGroup {
     // Elliptic Curve Groups (ECDHE)
     SECP256R1,
@@ -424,6 +424,7 @@ impl ReadablePacketFragment for Extension {
 impl WritablePacketFragment for Extension {
     fn written_length(&self) -> usize {
         let len = match self {
+            Extension::ServerName(server_name_list) if server_name_list.len() == 0 => 0,
             Extension::ServerName(server_name_list) => server_name_list.written_length(),
             Extension::MaxFragmentLength => unimplemented!(),
             Extension::StatusRequest => unimplemented!(),
@@ -476,6 +477,9 @@ impl WritablePacketFragment for Extension {
 
         match self {
             Extension::ServerName(server_name_list) => {
+                if server_name_list.len() == 0 {
+                    return Ok(written);
+                }
                 written += server_name_list.write(buffer)?;
             }
             Extension::MaxFragmentLength => unimplemented!(),

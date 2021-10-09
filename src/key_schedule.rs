@@ -1,7 +1,8 @@
-use std::io::Write;
+use std::{io::Write, sync::{Arc, atomic::{AtomicU64, Ordering}}};
 
 use ring::{
     hkdf,
+    hmac,
     aead::{self, BoundKey},
 };
 
@@ -75,25 +76,37 @@ impl From<hkdf::Okm<'_, IvLen>> for Iv {
 }
 
 impl Iv {
-    fn to_nonce_sequence(self) -> TlsNonceSequence {
+    fn to_nonce_sequence(self, msg_counter: MessageCounter) -> TlsNonceSequence {
         TlsNonceSequence {
             iv: self,
-            seq: 0,
+            msg_counter,
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct MessageCounter(Arc<AtomicU64>);
+
+impl MessageCounter {
+    pub fn new() -> Self {
+        MessageCounter(Arc::new(AtomicU64::new(0)))
+    }
+
+    pub fn inc_and_get(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst)
     }
 }
 
 pub struct TlsNonceSequence {
     iv: Iv,
-    seq: u64,
+    msg_counter: MessageCounter,
 }
 
 impl aead::NonceSequence for TlsNonceSequence {
     fn advance(&mut self) -> std::result::Result<aead::Nonce, ring::error::Unspecified> {
         let [ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 ] = self.iv.0;
-        let [ b4, b5, b6, b7, b8, b9, b10, b11 ] = self.seq.to_be_bytes();
-
-        self.seq += 1;
+        let [ b4, b5, b6, b7, b8, b9, b10, b11 ] = 
+            self.msg_counter.inc_and_get().to_be_bytes();
 
         Ok(aead::Nonce::assume_unique_for_key([
             a0, a1, a2, a3,
@@ -103,86 +116,210 @@ impl aead::NonceSequence for TlsNonceSequence {
     }
 }
 
-pub fn derive_secrets(shared_secret: &[u8], hello_hash: &[u8]) -> Result<(aead::OpeningKey<TlsNonceSequence>, aead::SealingKey<TlsNonceSequence>)> {
-    let zero: Vec<u8> = (0..32).map(|_| 0).collect();
+fn empty_hash() -> Vec<u8> {
+    use sha2::Digest;
 
-    let empty_hash: Vec<u8> = {
-        use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"");
+    hasher.finalize().to_vec()
+}
 
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"");
-        hasher.finalize().to_vec()
-    };
+fn zero(n: usize) -> Vec<u8> {
+    (0..n).map(|_| 0).collect()
+}
 
-    let derived_secret: hkdf::Salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &zero)
-        .extract(&zero)
-        .expand(
-            &[ &HkdfLabel::expand("derived", &empty_hash, 32)? ],
-            hkdf::HKDF_SHA256,
-        )
-        .map_err(|_| Error::Hkdf)?
-        .into();
 
-    let handshake_secret = derived_secret
-        .extract(&shared_secret);
+pub struct HandshakeKeySchedule {
+    handshake_secret: ring::hkdf::Prk,
+    pub server_handshake_key: aead::OpeningKey<TlsNonceSequence>,
+    pub client_handshake_key: aead::SealingKey<TlsNonceSequence>,
+    pub server_finished_key: hmac::Key,
+    pub client_finished_key: hmac::Key,
+}
 
-    let client_handshake_traffic_secret: hkdf::Prk = handshake_secret
-        .expand(
-            &[ &HkdfLabel::expand("c hs traffic", &hello_hash, 32)? ],
-            hkdf::HKDF_SHA256,
-        )
-        .map_err(|_| Error::Hkdf)?
-        .into();
+impl HandshakeKeySchedule {
+    pub fn derive(shared_secret: &[u8], hello_hash: &[u8]) -> Result<HandshakeKeySchedule> {
+        let derived_secret: hkdf::Salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &zero(32))
+            .extract(&zero(32))
+            .expand(
+                &[ &HkdfLabel::expand("derived", &empty_hash(), 32)? ],
+                hkdf::HKDF_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
 
-    let server_handshake_traffic_secret: hkdf::Prk = handshake_secret
-        .expand(
-            &[ &HkdfLabel::expand("s hs traffic", &hello_hash, 32)? ],
-            hkdf::HKDF_SHA256,
-        )
-        .map_err(|_| Error::Hkdf)?
-        .into();
+        let handshake_secret = derived_secret
+            .extract(&shared_secret);
 
-    let client_handshake_key: aead::UnboundKey = client_handshake_traffic_secret
-        .expand(
-            &[ &HkdfLabel::expand("key", &[], 16)? ],
-            &aead::AES_128_GCM,
-        )
-        .map_err(|_| Error::Hkdf)?
-        .into();
+        let client_handshake_traffic_secret: hkdf::Prk = handshake_secret
+            .expand(
+                &[ &HkdfLabel::expand("c hs traffic", &hello_hash, 32)? ],
+                hkdf::HKDF_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
 
-    let server_handshake_key: aead::UnboundKey = server_handshake_traffic_secret
-        .expand(
-            &[ &HkdfLabel::expand("key", &[], 16)? ],
-            &aead::AES_128_GCM,
-        )
-        .map_err(|_| Error::Hkdf)?
-        .into();
+        let client_finished_key: hmac::Key = client_handshake_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("finished", b"", 32)? ],
+                hmac::HMAC_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
 
-    let client_handshake_iv: Iv = client_handshake_traffic_secret
-        .expand(
-            &[ &HkdfLabel::expand("iv", &[], 12)? ],
-            IvLen,
-        )
-        .map_err(|_| Error::Hkdf)?
-        .into();
+        let server_handshake_traffic_secret: hkdf::Prk = handshake_secret
+            .expand(
+                &[ &HkdfLabel::expand("s hs traffic", &hello_hash, 32)? ],
+                hkdf::HKDF_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
 
-    let server_handshake_iv: Iv = server_handshake_traffic_secret
-        .expand(
-            &[ &HkdfLabel::expand("iv", &[], 12)? ],
-            IvLen,
-        )
-        .map_err(|_| Error::Hkdf)?
-        .into();
+        let server_finished_key: hmac::Key = server_handshake_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("finished", b"", 32)? ],
+                hmac::HMAC_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
 
-    let client_handshake_key = aead::SealingKey::new(
-        client_handshake_key,
-        client_handshake_iv.to_nonce_sequence(),
-    );
+        let client_handshake_key: aead::UnboundKey = client_handshake_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("key", &[], 16)? ],
+                &aead::AES_128_GCM,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
 
-    let server_handshake_key = aead::OpeningKey::new(
-        server_handshake_key,
-        server_handshake_iv.to_nonce_sequence(),
-    );
+        let server_handshake_key: aead::UnboundKey = server_handshake_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("key", &[], 16)? ],
+                &aead::AES_128_GCM,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
 
-    Ok((server_handshake_key, client_handshake_key))
+        let client_handshake_iv: Iv = client_handshake_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("iv", &[], 12)? ],
+                IvLen,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let server_handshake_iv: Iv = server_handshake_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("iv", &[], 12)? ],
+                IvLen,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let handshake_msg_counter = MessageCounter::new();
+
+        let client_handshake_key = aead::SealingKey::new(
+            client_handshake_key,
+            client_handshake_iv.to_nonce_sequence(handshake_msg_counter.clone()),
+        );
+
+        let handshake_msg_counter = MessageCounter::new();
+
+        let server_handshake_key = aead::OpeningKey::new(
+            server_handshake_key,
+            server_handshake_iv.to_nonce_sequence(handshake_msg_counter),
+        );
+
+        Ok(HandshakeKeySchedule {
+            handshake_secret,
+            client_handshake_key,
+            server_handshake_key,
+            server_finished_key,
+            client_finished_key,
+        })
+    }
+
+    pub fn derive_application_schedule(&self, handshake_hash: &[u8]) -> Result<ApplicationKeySchedule> {
+        let derived_secret: hkdf::Salt = self.handshake_secret
+            .expand(
+                &[ &HkdfLabel::expand("derived", &empty_hash(), 32)? ],
+                hkdf::HKDF_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let master_secret = derived_secret
+            .extract(&zero(32));
+
+        let client_application_traffic_secret: hkdf::Prk = master_secret
+            .expand(
+                &[ &HkdfLabel::expand("c ap traffic", handshake_hash, 32)? ],
+                hkdf::HKDF_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let server_application_traffic_secret: hkdf::Prk = master_secret
+            .expand(
+                &[ &HkdfLabel::expand("s ap traffic", handshake_hash, 32)? ],
+                hkdf::HKDF_SHA256,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let client_application_key: aead::UnboundKey = client_application_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("key", &[], 16)? ],
+                &aead::AES_128_GCM,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let server_application_key: aead::UnboundKey = server_application_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("key", &[], 16)? ],
+                &aead::AES_128_GCM,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let client_application_iv: Iv = client_application_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("iv", &[], 12)? ],
+                IvLen,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let server_application_iv: Iv = server_application_traffic_secret
+            .expand(
+                &[ &HkdfLabel::expand("iv", &[], 12)? ],
+                IvLen,
+            )
+            .map_err(|_| Error::Hkdf)?
+            .into();
+
+        let application_msg_counter = MessageCounter::new();
+
+        let client_application_key = aead::SealingKey::new(
+            client_application_key,
+            client_application_iv.to_nonce_sequence(application_msg_counter),
+        );
+
+        let application_msg_counter = MessageCounter::new();
+
+        let server_application_key = aead::OpeningKey::new(
+            server_application_key,
+            server_application_iv.to_nonce_sequence(application_msg_counter),
+        );
+
+        Ok(ApplicationKeySchedule {
+            client_application_key,
+            server_application_key,
+        })
+    }
+}
+
+pub struct ApplicationKeySchedule {
+    pub server_application_key: aead::OpeningKey<TlsNonceSequence>,
+    pub client_application_key: aead::SealingKey<TlsNonceSequence>,
 }

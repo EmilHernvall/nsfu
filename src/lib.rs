@@ -168,7 +168,7 @@ impl ReadablePacketFragment for RecordType {
 
 impl WritablePacketFragment for RecordType {
     fn written_length(&self) -> usize {
-        2
+        1
     }
 
     fn write<B: Write>(&self, buffer: &mut B) -> Result<usize> {
@@ -182,7 +182,7 @@ impl WritablePacketFragment for RecordType {
 
         record_type.write(buffer)?;
 
-        Ok(2)
+        Ok(1)
     }
 }
 
@@ -300,7 +300,7 @@ impl WritablePacketFragment for RecordVariant {
         let mut written = 0;
 
         written += self.record_type().write(buffer)?;
-        written += ProtocolVersion::tlsv1().write(buffer)?;
+        written += ProtocolVersion::tlsv2().write(buffer)?;
 
         let len = (self.written_length() - 5) as u16;
         written += len.write(buffer)?;
